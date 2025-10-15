@@ -14,6 +14,72 @@
 #include <numeric>
 
 /**
+ * PID Controller for throttle control
+ * Converts desired velocity to normalized throttle command
+ */
+class PIDController {
+public:
+    PIDController(double kp, double ki, double kd, double output_min, double output_max)
+        : kp_(kp), ki_(ki), kd_(kd), 
+          output_min_(output_min), output_max_(output_max),
+          integral_(0.0), previous_error_(0.0), first_run_(true) {}
+    
+    double compute(double setpoint, double measured_value, double dt) {
+        // Calculate error
+        double error = setpoint - measured_value;
+        
+        // Proportional term
+        double p_term = kp_ * error;
+        
+        // Integral term with anti-windup
+        integral_ += error * dt;
+        // Clamp integral to prevent windup
+        double max_integral = 1.0 / ki_;  // Limit integral contribution
+        integral_ = std::clamp(integral_, -max_integral, max_integral);
+        double i_term = ki_ * integral_;
+        
+        // Derivative term
+        double d_term = 0.0;
+        if (!first_run_) {
+            double derivative = (error - previous_error_) / dt;
+            d_term = kd_ * derivative;
+        } else {
+            first_run_ = false;
+        }
+        
+        // Compute output
+        double output = p_term + i_term + d_term;
+        
+        // Clamp output to valid range
+        output = std::clamp(output, output_min_, output_max_);
+        
+        // Store error for next iteration
+        previous_error_ = error;
+        
+        return output;
+    }
+    
+    void reset() {
+        integral_ = 0.0;
+        previous_error_ = 0.0;
+        first_run_ = true;
+    }
+    
+    void setGains(double kp, double ki, double kd) {
+        kp_ = kp;
+        ki_ = ki;
+        kd_ = kd;
+    }
+
+private:
+    double kp_, ki_, kd_;
+    double output_min_, output_max_;
+    double integral_;
+    double previous_error_;
+    bool first_run_;
+};
+
+/**
  * Extended Kalman Filter for IMU-based position estimation
  * State vector: [px, py, vx, vy, ax, ay] (position, velocity, acceleration bias)
  * This helps compensate for IMU drift and bias
@@ -189,7 +255,8 @@ public:
     : Node("adaptive_pure_pursuit_autodrive"),
       heading_angle_(0.5), previous_deviation_(0.0), total_area_(0.0),
       initialized_(false), lookahead_distance_(1.0), a_(1.0), r_(0.8), control_velocity_(0.1),
-      gravity_magnitude_(9.81)  // Gravity constant
+      gravity_magnitude_(9.81),  // Gravity constant
+      throttle_pid_(0.0, 0.0, 0.0, -1.0, 1.0)  // Initialize PID with default gains
     {
         // Parameters (tunable)
         max_speed_ = this->declare_parameter("max_speed", 20.0);
@@ -206,10 +273,11 @@ public:
         window_size_ = this->declare_parameter("window_size", 5);
         vel_window = this->declare_parameter("vel_window", 5);
         
-        // **Throttle mapping parameters**
-        min_throttle_ = this->declare_parameter("min_throttle", 0.15);  // Minimum throttle to overcome friction
-        throttle_mapping_type_ = this->declare_parameter("throttle_mapping_type", 2);  // 1=simple, 2=range, 3=nonlinear
-        throttle_nonlinear_exponent_ = this->declare_parameter("throttle_nonlinear_exponent", 0.7);
+        // PID parameters for throttle control
+        pid_kp_ = this->declare_parameter("pid_kp", 0.15);
+        pid_ki_ = this->declare_parameter("pid_ki", 0.02);
+        pid_kd_ = this->declare_parameter("pid_kd", 0.01);
+        throttle_pid_.setGains(pid_kp_, pid_ki_, pid_kd_);
 
         // Initialize position and IMU data
         current_quaternion_ = {0.0, 0.0, 0.0, 1.0};
@@ -222,6 +290,9 @@ public:
         
         // Initialize gravity vector (will be updated based on IMU orientation)
         gravity_vector_ = Eigen::Vector3d(0, 0, -gravity_magnitude_);
+        
+        // Initialize timing
+        last_control_time_ = this->get_clock()->now();
 
         // Subscribe to sensors (NO IPS subscription anymore)
         imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
@@ -253,6 +324,7 @@ public:
 
         RCLCPP_INFO(this->get_logger(), "AdaptivePurePursuit node with IMU-based position estimation ready.");
         RCLCPP_INFO(this->get_logger(), "Initial position: x=%.4f, y=%.4f", initial_position_.x(), initial_position_.y());
+        RCLCPP_INFO(this->get_logger(), "PID Gains - Kp: %.3f, Ki: %.3f, Kd: %.3f", pid_kp_, pid_ki_, pid_kd_);
     }
 
 private:
@@ -279,10 +351,10 @@ private:
     size_t window_size_, vel_window;
     double current_speed_;
     
-    // **Throttle mapping parameters**
-    double min_throttle_;
-    int throttle_mapping_type_;
-    double throttle_nonlinear_exponent_;
+    // **PID Controller for throttle**
+    PIDController throttle_pid_;
+    double pid_kp_, pid_ki_, pid_kd_;
+    rclcpp::Time last_control_time_;
     
     // **New members for IMU-based position estimation**
     IMUKalmanFilter kalman_filter_;
@@ -618,58 +690,40 @@ private:
         race_pub_->publish(raceline_markers);
     }
     
+    /**
+     * Publish control commands with PID-based throttle control
+     * Converts desired velocity to normalized throttle command using PID
+     */
     void publish_control_commands() {
+        // Publish steering command
         std_msgs::msg::Float32 steer_cmd;
         steer_cmd.data = std::clamp(heading_angle_ * heading_scale_, -0.24, 0.24);  
         steering_pub_->publish(steer_cmd);
         
-        // **Normalize throttle command**
-        // control_velocity_ is in m/s (ranging from min_speed_ to max_speed_)
-        // We need to convert this to normalized throttle [0, 1]
+        // Calculate time step for PID
+        rclcpp::Time current_time = this->get_clock()->now();
+        double dt = (current_time - last_control_time_).seconds();
         
-        double normalized_throttle = 0.0;
-        
-        if (control_velocity_ <= 0) {
-            normalized_throttle = 0.0;  // No negative throttle (no reverse)
-        } else {
-            // Select throttle mapping based on parameter
-            switch (throttle_mapping_type_) {
-                case 1:  // Simple linear mapping from 0 to max_speed
-                    normalized_throttle = control_velocity_ / max_speed_;
-                    break;
-                    
-                case 2:  // Linear mapping from min_speed to max_speed (default)
-                    normalized_throttle = (control_velocity_ - min_speed_) / (max_speed_ - min_speed_);
-                    break;
-                    
-                case 3:  // Non-linear mapping for better control at low speeds
-                    normalized_throttle = std::pow(control_velocity_ / max_speed_, throttle_nonlinear_exponent_);
-                    break;
-                    
-                default:  // Fallback to type 2
-                    normalized_throttle = (control_velocity_ - min_speed_) / (max_speed_ - min_speed_);
-                    break;
-            }
-            
-            // Clamp to [0, 1] range
-            normalized_throttle = std::max(0.0, std::min(1.0, normalized_throttle));
+        // Sanity check on dt
+        if (dt <= 0.0 || dt > 0.5) {
+            dt = 0.01;  // Default to 100Hz if invalid
         }
+        last_control_time_ = current_time;
         
-        // Apply minimum throttle to keep the vehicle moving
-        // Only apply if we're trying to move (normalized_throttle > 0)
-        if (normalized_throttle > 0.01 && normalized_throttle < min_throttle_) {
-            normalized_throttle = min_throttle_;
-        }
+        // Use PID to compute throttle command
+        // Setpoint: control_velocity_ (desired speed)
+        // Process variable: current_speed_ (actual speed)
+        double throttle_command = throttle_pid_.compute(control_velocity_, current_speed_, dt);
         
+        // Publish normalized throttle command [-1.0, 1.0]
         std_msgs::msg::Float32 throttle_cmd;
-        throttle_cmd.data = static_cast<float>(normalized_throttle);
-        
-        // Debug output (throttled to avoid spam)
-        RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 500,
-            "Control: Speed=%.2f m/s, Throttle=%.3f (normalized), Steering=%.3f rad",
-            control_velocity_, normalized_throttle, heading_angle_ * heading_scale_);
-        
+        throttle_cmd.data = static_cast<float>(throttle_command);
         throttle_pub_->publish(throttle_cmd);
+        
+        // Debug output (throttled)
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "Control - Desired Speed: %.2f, Current Speed: %.2f, Throttle: %.3f, Steering: %.3f",
+            control_velocity_, current_speed_, throttle_command, steer_cmd.data);
     }
 };
 
